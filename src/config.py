@@ -15,8 +15,8 @@ if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY not set in .env file")
 
 # LLM
-LLM_MODEL = "llama-3.1-8b-instant"
-LLM_TEMPERATURE = 0
+LLM_MODEL = "llama-3.3-70b-versatile"
+LLM_TEMPERATURE = 0.3
 
 # Embeddings
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"

@@ -1,3 +1,4 @@
+from pathlib import Path
 from langchain_groq import ChatGroq
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
@@ -10,9 +11,10 @@ def format_docs(docs):
     """Convert retrieved chunks into a single string for the prompt."""
     parts = []
     for i, d in enumerate(docs, 1):
-        source = d.metadata.get("source", "?")
+        raw_source = d.metadata.get("source", "?")
+        filename = Path(raw_source).name if raw_source != "?" else "?"
         page = d.metadata.get("page", "?")
-        parts.append(f"[Source {i}: {source} (page {page})]\n{d.page_content}")
+        parts.append(f"[Source {i}: {filename} (page {page})]\n{d.page_content}")
     return "\n\n".join(parts)
 
 
