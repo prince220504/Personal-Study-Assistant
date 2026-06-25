@@ -21,9 +21,15 @@ import re
 from typing import TypedDict, List, Optional, Literal
 
 from langchain_groq import ChatGroq
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+from langchain_core.exceptions import OutputParserException
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 
 from .ingest import build_vectorstore
 from .prompts import QUIZ_GEN_PROMPT, GRADE_PROMPT, HINT_PROMPT
+from .schemas import QuizQuestion, GradeResult
 from .config import GROQ_API_KEY, LLM_MODEL, TOP_K
 
 
@@ -61,6 +67,27 @@ _llm = ChatGroq(
 )
 _vs = build_vectorstore()
 _retriever = _vs.as_retriever(search_kwargs={"k": TOP_K})
+
+# ---------- Output parsers ----------
+# JsonOutputParser uses the Pydantic models to (a) generate format
+# instructions injected into the prompt and (b) validate the LLM output.
+# We cache the format-instruction strings here because they never change
+# at runtime — building them once per import saves a few ms per call.
+
+_question_parser = JsonOutputParser(pydantic_object=QuizQuestion)
+_grade_parser = JsonOutputParser(pydantic_object=GradeResult)
+_str_parser = StrOutputParser()
+
+_question_format = _question_parser.get_format_instructions()
+_grade_format = _grade_parser.get_format_instructions()
+
+# Pre-built LCEL chains: prompt | llm | parser
+# The parser hands us a validated dict (NOT a Pydantic instance — that's
+# JsonOutputParser's behaviour; PydanticOutputParser would return the
+# model instance instead, but a dict is simpler to merge into state).
+_question_chain = QUIZ_GEN_PROMPT | _llm | _question_parser
+_grade_chain = GRADE_PROMPT | _llm | _grade_parser
+_hint_chain = HINT_PROMPT | _llm | _str_parser
 
 
 # ---------- Helpers ----------
@@ -131,9 +158,21 @@ def generate_question(state: QuizState) -> dict:
     """
     Node: ask the LLM to write ONE question + the expected answer.
     Resets per-question fields (retries, hint, user_answer, verdict, feedback).
+
+    Primary path: prompt | llm | JsonOutputParser validates against QuizQuestion.
+    Fallback: if the parser rejects the LLM output, try _safe_json_loads as
+    a last-ditch attempt before surfacing the error.
     """
-    raw = (QUIZ_GEN_PROMPT | _llm).invoke({"context": state["context"]}).content
-    data = _safe_json_loads(raw)
+    inputs = {
+        "context": state["context"],
+        "format_instructions": _question_format,
+    }
+    try:
+        data = _question_chain.invoke(inputs)
+    except OutputParserException:
+        raw = (QUIZ_GEN_PROMPT | _llm).invoke(inputs).content
+        data = _safe_json_loads(raw)
+
     return {
         "question": data["question"],
         "expected": data["expected_answer"],
@@ -149,17 +188,31 @@ def grade_answer(state: QuizState) -> dict:
     """
     Node: grade student's answer against expected + source.
     Verdict: correct | partial | incorrect.
+
+    Primary path: prompt | llm | JsonOutputParser validates against GradeResult,
+    which enforces verdict ∈ {correct, partial, incorrect}.
+    Fallback: _safe_json_loads if the parser rejects the output.
     """
-    raw = (GRADE_PROMPT | _llm).invoke({
+    inputs = {
         "question": state["question"],
         "expected": state["expected"],
         "answer": state["user_answer"],
         "context": state["context"],
-    }).content
-    data = _safe_json_loads(raw)
+        "format_instructions": _grade_format,
+    }
+    try:
+        data = _grade_chain.invoke(inputs)
+    except OutputParserException:
+        raw = (GRADE_PROMPT | _llm).invoke(inputs).content
+        data = _safe_json_loads(raw)
+
+    verdict = data.get("verdict", "incorrect")
+    if verdict not in {"correct", "partial", "incorrect"}:
+        verdict = "incorrect"
+
     return {
-        "verdict": data["verdict"],
-        "feedback": data["feedback"],
+        "verdict": verdict,
+        "feedback": data.get("feedback", ""),
     }
 
 
@@ -167,14 +220,16 @@ def give_hint(state: QuizState) -> dict:
     """
     Node: nudge student toward the answer without revealing it.
     Bumps retries counter so we cap at one retry per question.
+
+    Plain-text output (no JSON contract needed), so we use StrOutputParser.
     """
-    raw = (HINT_PROMPT | _llm).invoke({
+    text = _hint_chain.invoke({
         "question": state["question"],
         "answer": state["user_answer"],
         "context": state["context"],
-    }).content
+    })
     return {
-        "hint": raw.strip(),
+        "hint": text.strip(),
         "retries": state["retries"] + 1,
     }
 
@@ -233,3 +288,78 @@ def route_after_advance(state: QuizState) -> Literal["new_question", "end"]:
     if state["asked_count"] >= state["max_questions"]:
         return "end"
     return "new_question"
+
+
+# ---------- Compiled graph (Day 3 upgrade) ----------
+#
+# Wire the same node functions into a real StateGraph. Two pause points
+# are needed for the quiz to work as an interactive loop:
+#
+#   1. before grade_answer (initial answer)
+#   2. before grade_answer again (retry after hint)
+#
+# A single interrupt_before=["grade_answer"] handles both, because the
+# grade_answer node is reached from two different incoming edges:
+#   generate_question -> grade_answer   (first attempt)
+#   give_hint         -> grade_answer   (retry)
+#
+# Streamlit drives the graph like this:
+#   - first run: graph.invoke(initial_state, config)  -> pauses before grade
+#   - after user submits answer:
+#       graph.update_state(config, {"user_answer": "..."})
+#       graph.invoke(None, config)                     -> resumes, grades,
+#                                                        either pauses again
+#                                                        (hint path) or
+#                                                        advances + asks
+#                                                        the next question
+
+
+def _build_quiz_graph():
+    """
+    Build and compile the quiz StateGraph with a MemorySaver checkpointer.
+
+    The checkpointer keeps state per `thread_id` so the same conversation
+    can be paused and resumed across multiple .invoke() calls. Streamlit
+    treats each quiz session as one thread_id.
+    """
+    g = StateGraph(QuizState)
+
+    # Nodes — same functions as the imperative path.
+    g.add_node("retrieve", retrieve_topic_content)
+    g.add_node("generate", generate_question)
+    g.add_node("grade", grade_answer)
+    g.add_node("hint", give_hint)
+    g.add_node("advance", advance_question)
+
+    # Static edges
+    g.add_edge(START, "retrieve")
+    g.add_edge("retrieve", "generate")
+    g.add_edge("generate", "grade")          # interrupt fires before grade
+    g.add_edge("hint", "grade")              # retry path — interrupt fires again
+
+    # Conditional edges
+    g.add_conditional_edges(
+        "grade",
+        route_after_grade,
+        {"hint": "hint", "advance": "advance"},
+    )
+    g.add_conditional_edges(
+        "advance",
+        route_after_advance,
+        {"new_question": "retrieve", "end": END},
+    )
+
+    return g.compile(
+        checkpointer=MemorySaver(),
+        interrupt_before=["grade"],
+    )
+
+
+# Build once at import time. The graph object is reusable across all
+# threads — only the checkpointed state is per-thread.
+QUIZ_GRAPH = _build_quiz_graph()
+
+
+def get_quiz_graph():
+    """Public accessor in case future code wants to rebuild with a different checkpointer."""
+    return QUIZ_GRAPH
