@@ -5,10 +5,13 @@
 
 # Vector DB
 chroma_db/
+user_chroma_db/
 
 # User notes (privacy + size)
 data/notes/*
 !data/notes/.gitkeep
+data/uploads/*
+!data/uploads/.gitkeep
 
 # Python
 __pycache__/

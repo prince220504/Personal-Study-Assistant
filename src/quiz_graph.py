@@ -1,14 +1,9 @@
 """
 Quiz Graph — LangGraph-style state machine for the Quiz Me feature.
 
-Day 2 implementation uses "option A": we define the State TypedDict and the
-node functions, but we DO NOT compile a LangGraph yet. The Streamlit page
-calls these node functions directly between reruns, and st.session_state
-holds the QuizState dict.
-
-Day 3 upgrade path: build a compiled StateGraph with a MemorySaver
-checkpointer and `interrupt_before=["grade_answer"]` so the graph pauses
-naturally for user input.
+The Streamlit page now drives the compiled StateGraph. LangGraph keeps the
+quiz state in a MemorySaver checkpoint and pauses before the grade node so
+Streamlit can collect the user's answer.
 
 Concepts used:
 - State: shared dict every node reads/writes
@@ -18,9 +13,11 @@ Concepts used:
 
 import json
 import re
+from pathlib import Path
 from typing import TypedDict, List, Optional, Literal
 
 from langchain_groq import ChatGroq
+# pyrefly: ignore [missing-import]
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_core.exceptions import OutputParserException
 
@@ -42,6 +39,7 @@ class QuizState(TypedDict):
     """
     topic: str                       # what the user wants to be quizzed on
     context: str                     # retrieved chunks joined as one string
+    source_citations: List[str]      # source file + page for each retrieved chunk
     question: Optional[str]          # current question text
     expected: Optional[str]          # expected answer (used for grading)
     user_answer: Optional[str]       # student's submitted answer
@@ -58,15 +56,31 @@ class QuizState(TypedDict):
 
 
 # ---------- Shared resources ----------
-# Built once at import time. Reused across all node calls.
+# The LLM can be built at import time, but the vector store cannot.
+# Users upload PDFs during the Streamlit session, so retrieval is loaded
+# lazily the first time a quiz asks for context.
 
 _llm = ChatGroq(
     model=LLM_MODEL,
     api_key=GROQ_API_KEY,
     temperature=0.3,
 )
-_vs = build_vectorstore()
-_retriever = _vs.as_retriever(search_kwargs={"k": TOP_K})
+_retriever = None
+
+
+def reset_quiz_resources():
+    """Clear cached retrieval resources after the user rebuilds the PDF index."""
+    global _retriever
+    _retriever = None
+
+
+def _get_retriever():
+    """Build/load the active user PDF retriever on demand."""
+    global _retriever
+    if _retriever is None:
+        vs = build_vectorstore()
+        _retriever = vs.as_retriever(search_kwargs={"k": TOP_K})
+    return _retriever
 
 # ---------- Output parsers ----------
 # JsonOutputParser uses the Pydantic models to (a) generate format
@@ -124,6 +138,7 @@ def make_initial_state(topic: str, max_questions: int) -> QuizState:
     return {
         "topic": topic,
         "context": "",
+        "source_citations": [],
         "question": None,
         "expected": None,
         "user_answer": None,
@@ -146,12 +161,26 @@ def retrieve_topic_content(state: QuizState) -> dict:
     """
     Node: pull top-k chunks from Chroma for the topic.
     Joins them into a single string the LLM can read.
+    Also extracts source citations (filename + page) for UI display.
     """
-    docs = _retriever.invoke(state["topic"])
+    docs = _get_retriever().invoke(state["topic"])
     if not docs:
-        return {"context": ""}
+        return {"context": "", "source_citations": []}
     ctx = "\n\n".join(d.page_content for d in docs)
-    return {"context": ctx}
+    citations = []
+    for d in docs:
+        raw = d.metadata.get("source", "?")
+        filename = Path(raw).name if raw != "?" else "?"
+        page = d.metadata.get("page", "?")
+        citations.append(f"{filename} (page {page})")
+    # Deduplicate while preserving order
+    seen = set()
+    unique_citations = []
+    for c in citations:
+        if c not in seen:
+            seen.add(c)
+            unique_citations.append(c)
+    return {"context": ctx, "source_citations": unique_citations}
 
 
 def generate_question(state: QuizState) -> dict:
@@ -231,6 +260,9 @@ def give_hint(state: QuizState) -> dict:
     return {
         "hint": text.strip(),
         "retries": state["retries"] + 1,
+        "user_answer": None,
+        "verdict": None,
+        "feedback": None,
     }
 
 
@@ -249,6 +281,7 @@ def advance_question(state: QuizState) -> dict:
             "user_answer": state["user_answer"],
             "verdict": state["verdict"],
             "topic": state["topic"],
+            "sources": list(state.get("source_citations", [])),
         }],
         "weak_topics": (
             state["weak_topics"] + [state["topic"]]
@@ -263,6 +296,7 @@ def advance_question(state: QuizState) -> dict:
         "feedback": None,
         "hint": None,
         "retries": 0,
+        "source_citations": [],
         "awaiting_continue": False,
     }
 
@@ -352,6 +386,7 @@ def _build_quiz_graph():
     return g.compile(
         checkpointer=MemorySaver(),
         interrupt_before=["grade"],
+        interrupt_after=["grade"],
     )
 
 

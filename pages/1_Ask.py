@@ -1,6 +1,9 @@
-import streamlit as st
 from pathlib import Path
+
+import streamlit as st
+
 from src.rag_chain import build_rag_chain
+from src.upload_ui import render_pdf_upload_panel
 
 
 @st.cache_resource
@@ -10,16 +13,21 @@ def get_chain():
 
 
 st.title("📖 Ask")
+st.caption("Ask questions about the PDFs you uploaded for this session.")
 
-st.caption("Ask any question about your study notes. The assistant answers from your documents.")
+ready = render_pdf_upload_panel()
+
+if not ready:
+    st.warning("Upload one or more PDFs and build the index before asking questions.")
+    st.stop()
 
 question = st.text_input(
     "Your question:",
-    placeholder="e.g. What is a transformer attention mechanism?",
+    placeholder="e.g. What is the main idea in this PDF?",
 )
 
 if question:
-    with st.spinner("Searching your notes + thinking..."):
+    with st.spinner("Searching your uploaded PDFs and thinking..."):
         chain, retriever = get_chain()
         answer = chain.invoke(question)
         sources = retriever.invoke(question)

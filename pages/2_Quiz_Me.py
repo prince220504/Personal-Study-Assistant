@@ -1,69 +1,77 @@
-"""
-Quiz Me page — Streamlit UI on top of the quiz_graph node functions.
-
-Day 2 design (option A from IMPLEMENTATION_PLAN.md section 4):
-We do NOT use a compiled LangGraph here. Instead we call the node
-functions imperatively from this page and stash the QuizState in
-st.session_state. Streamlit's own rerun model handles the "pause for
-user input" part naturally.
-
-Day 3 upgrade: replace this with a compiled StateGraph that uses
-MemorySaver + interrupt_before=["grade_answer"].
-"""
+from uuid import uuid4
 
 import streamlit as st
 
-from src.quiz_graph import (
-    make_initial_state,
-    retrieve_topic_content,
-    generate_question,
-    grade_answer,
-    give_hint,
-    advance_question,
-    route_after_grade,
-    route_after_advance,
-)
+from src.quiz_graph import get_quiz_graph, make_initial_state
+from src.upload_ui import render_pdf_upload_panel, list_uploaded_pdfs
 
-
-# ---------- Page setup ----------
 
 st.title("🧠 Quiz Me")
-st.caption("Pick a topic from your notes. The assistant generates questions, grades your answers, and tracks weak spots.")
+st.caption("Quiz yourself from your uploaded PDFs. LangGraph controls the quiz state and retry flow.")
+
+ready = render_pdf_upload_panel()
+
+if not ready:
+    st.warning("Upload one or more PDFs and build the index before starting a quiz.")
+    st.stop()
+
+if "quiz_thread_id" not in st.session_state:
+    st.session_state.quiz_thread_id = None
+if "quiz_state" not in st.session_state:
+    st.session_state.quiz_state = None
 
 
-# ---------- Initialise session state ----------
-
-if "quiz" not in st.session_state:
-    st.session_state.quiz = None
+def _graph_config():
+    return {"configurable": {"thread_id": st.session_state.quiz_thread_id}}
 
 
-# ---------- Helper: start the next question ----------
-
-def _start_next_question():
-    """Retrieve fresh context for the topic and generate the next question."""
-    s = st.session_state.quiz
-    s.update(retrieve_topic_content(s))
-    if not s["context"]:
-        st.error(
-            f"No chunks found for topic '{s['topic']}'. "
-            "Try a topic that matches words used in your notes."
-        )
-        st.session_state.quiz = None
-        st.stop()
-    s.update(generate_question(s))
-    st.session_state.quiz = s
+def _reset_quiz():
+    st.session_state.quiz_thread_id = None
+    st.session_state.quiz_state = None
 
 
-# ---------- Screen 1: setup ----------
+def _start_quiz(topic, max_questions):
+    graph = get_quiz_graph()
+    st.session_state.quiz_thread_id = f"quiz-{uuid4()}"
+    initial_state = make_initial_state(topic, max_questions)
+    st.session_state.quiz_state = graph.invoke(initial_state, _graph_config())
 
-if st.session_state.quiz is None:
+
+def _submit_answer(answer):
+    graph = get_quiz_graph()
+    graph.update_state(_graph_config(), {"user_answer": answer})
+    st.session_state.quiz_state = graph.invoke(None, _graph_config())
+
+
+def _continue_after_feedback():
+    graph = get_quiz_graph()
+    st.session_state.quiz_state = graph.invoke(None, _graph_config())
+
+
+# ---------- Quiz setup screen ----------
+
+if st.session_state.quiz_state is None:
     st.subheader("Start a new quiz")
 
-    topic = st.text_input(
-        "Topic",
-        placeholder="e.g. embeddings, transformers, RAG",
+    # Topic dropdown from uploaded PDF filenames + free-text option
+    pdfs = list_uploaded_pdfs()
+    pdf_names = [p.stem for p in pdfs]  # filename without extension
+
+    topic_options = ["(type your own)"] + pdf_names
+    selected_option = st.selectbox(
+        "Pick a topic from your PDFs or type your own:",
+        options=topic_options,
     )
-    n = st.number_input(
+
+    if selected_option == "(type your own)":
+        topic = st.text_input(
+            "Topic",
+            placeholder="e.g. summary, chapter 1, transformers, evaluation metrics",
+        )
+    else:
+        topic = selected_option
+
+    max_questions = st.number_input(
         "How many questions?",
         min_value=1,
         max_value=20,
@@ -72,117 +80,132 @@ if st.session_state.quiz is None:
     )
 
     if st.button("Start quiz", type="primary", disabled=not topic.strip()):
-        st.session_state.quiz = make_initial_state(topic.strip(), int(n))
-        with st.spinner("Picking a question for you..."):
-            _start_next_question()
+        with st.spinner("LangGraph is retrieving context and generating a question..."):
+            _start_quiz(topic.strip(), int(max_questions))
         st.rerun()
 
+    st.stop()
 
-# ---------- Screen 2: active quiz ----------
+
+# ---------- Active quiz ----------
+
+state = st.session_state.quiz_state
+
+if not state.get("context"):
+    st.error(
+        f"No useful chunks were retrieved for topic '{state['topic']}'. "
+        "Try a topic or keyword that appears in your uploaded PDFs."
+    )
+    if st.button("Start over"):
+        _reset_quiz()
+        st.rerun()
+    st.stop()
+
+# ---------- Quiz complete screen ----------
+
+if state["asked_count"] >= state["max_questions"]:
+    st.subheader("Quiz complete")
+    st.metric("Score", f"{state['score']} / {state['max_questions']}")
+
+    weak = sorted(set(state["weak_topics"]))
+    if weak:
+        st.markdown("### Weak topics")
+        for topic in weak:
+            st.markdown(f"- {topic}")
+    else:
+        st.success("No weak topics. Nice work.")
+
+    with st.expander("Review your answers"):
+        for i, entry in enumerate(state["history"], 1):
+            st.markdown(f"**Q{i} ({entry['verdict']}):** {entry['q']}")
+            st.markdown(f"- Your answer: {entry['user_answer']}")
+            st.markdown(f"- Expected: {entry['expected']}")
+            sources = entry.get("sources", [])
+            if sources:
+                st.caption(f"📄 Sources: {', '.join(sources)}")
+            st.divider()
+
+    col1, col2, col3 = st.columns([1, 1, 3])
+    with col1:
+        if st.button("Start over"):
+            _reset_quiz()
+            st.rerun()
+    with col2:
+        # Re-quiz weak topics button
+        if weak:
+            if st.button("Re-quiz weak topics", type="primary"):
+                weak_topic_str = ", ".join(weak)
+                with st.spinner(f"Starting quiz on weak topics: {weak_topic_str}..."):
+                    _reset_quiz()
+                    _start_quiz(weak_topic_str, min(len(weak) * 2, 10))
+                st.rerun()
+
+    st.stop()
+
+
+# ---------- Question in progress ----------
+
+st.progress(state["asked_count"] / state["max_questions"])
+st.caption(
+    f"Question {state['asked_count'] + 1} of {state['max_questions']} | "
+    f"Topic: {state['topic']} | Graph thread: {st.session_state.quiz_thread_id}"
+)
+
+st.markdown(f"### {state['question']}")
+
+# Source citations for the current question
+citations = state.get("source_citations", [])
+if citations:
+    st.caption(f"📄 Sources: {', '.join(citations)}")
+
+if state.get("verdict"):
+    verdict = state["verdict"]
+    feedback = state.get("feedback", "")
+    if verdict == "correct":
+        st.success(f"Correct — {feedback}")
+    elif verdict == "partial":
+        st.warning(f"Partial — {feedback}")
+    else:
+        st.error(f"Incorrect — {feedback}")
+
+    if state.get("user_answer"):
+        with st.expander("Your previous answer"):
+            st.write(state["user_answer"])
+
+if state.get("hint"):
+    st.info(f"Hint: {state['hint']}")
+
+if state.get("verdict"):
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        continue_quiz = st.button("Continue", type="primary")
+    with col2:
+        quit_quiz = st.button("Quit quiz")
+
+    if quit_quiz:
+        _reset_quiz()
+        st.rerun()
+
+    if continue_quiz:
+        with st.spinner("LangGraph is routing the next step..."):
+            _continue_after_feedback()
+        st.rerun()
 
 else:
-    s = st.session_state.quiz
+    answer_key = f"answer_{st.session_state.quiz_thread_id}_{state['asked_count']}_{state['retries']}"
+    user_answer = st.text_area("Your answer", key=answer_key, height=100)
 
-    # ---- Final-score screen ----
-    if s["asked_count"] >= s["max_questions"]:
-        st.subheader("Quiz complete")
-        st.metric("Score", f"{s['score']} / {s['max_questions']}")
+    col1, col2 = st.columns([1, 5])
+    with col1:
+        submit = st.button("Submit", type="primary", disabled=not user_answer.strip())
+    with col2:
+        quit_quiz = st.button("Quit quiz")
 
-        weak = sorted(set(s["weak_topics"]))
-        if weak:
-            st.markdown("### Weak topics")
-            for t in weak:
-                st.markdown(f"- {t}")
-        else:
-            st.success("No weak topics — great job!")
+    if quit_quiz:
+        _reset_quiz()
+        st.rerun()
 
-        with st.expander("Review your answers"):
-            for i, entry in enumerate(s["history"], 1):
-                st.markdown(f"**Q{i} ({entry['verdict']}):** {entry['q']}")
-                st.markdown(f"- Your answer: {entry['user_answer']}")
-                st.markdown(f"- Expected: {entry['expected']}")
-                st.divider()
-
-        if st.button("Start over"):
-            st.session_state.quiz = None
-            st.rerun()
-
-    # ---- Active question screen ----
-    else:
-        # Progress
-        st.progress(s["asked_count"] / s["max_questions"])
-        st.caption(f"Question {s['asked_count'] + 1} of {s['max_questions']}  ·  Topic: {s['topic']}")
-
-        st.markdown(f"### {s['question']}")
-
-        # Persistent feedback banner — survives reruns
-        if s.get("verdict"):
-            verdict = s["verdict"]
-            feedback = s.get("feedback", "")
-            if verdict == "correct":
-                st.success(f"✅ Correct — {feedback}")
-            elif verdict == "partial":
-                st.warning(f"🟡 Partial — {feedback}")
-            else:
-                st.error(f"❌ Incorrect — {feedback}")
-
-            # Show what they answered so they can compare
-            if s.get("user_answer"):
-                with st.expander("Your answer"):
-                    st.write(s["user_answer"])
-
-        # Show hint (if previous attempt was wrong and they can retry)
-        if s.get("hint"):
-            st.info(f"💡 Hint: {s['hint']}")
-
-        # ---- Branch: waiting for "Continue" vs accepting new answer ----
-        if s.get("awaiting_continue"):
-            # User has read the verdict. Move on when ready.
-            if st.button("Continue →", type="primary"):
-                s.update(advance_question(s))
-                st.session_state.quiz = s
-                if s["asked_count"] < s["max_questions"]:
-                    with st.spinner("Picking the next question..."):
-                        _start_next_question()
-                st.rerun()
-
-            if st.button("Quit quiz"):
-                st.session_state.quiz = None
-                st.rerun()
-
-        else:
-            # Accept a (possibly retry) answer
-            answer_key = f"answer_{s['asked_count']}_{s['retries']}"
-            user_answer = st.text_area(
-                "Your answer",
-                key=answer_key,
-                height=100,
-            )
-
-            col1, col2 = st.columns([1, 5])
-            with col1:
-                submit = st.button("Submit", type="primary", disabled=not user_answer.strip())
-            with col2:
-                quit_btn = st.button("Quit quiz")
-
-            if quit_btn:
-                st.session_state.quiz = None
-                st.rerun()
-
-            if submit:
-                s["user_answer"] = user_answer.strip()
-                with st.spinner("Grading..."):
-                    s.update(grade_answer(s))
-
-                next_step = route_after_grade(s)
-                if next_step == "hint":
-                    # Wrong, can still retry — show hint and let them try again
-                    with st.spinner("Thinking of a hint..."):
-                        s.update(give_hint(s))
-                    s["awaiting_continue"] = False
-                else:
-                    # Correct, or out of retries — pause for user to read before advancing
-                    s["awaiting_continue"] = True
-
-                st.session_state.quiz = s
-                st.rerun()
+    if submit:
+        with st.spinner("LangGraph is grading your answer..."):
+            _submit_answer(user_answer.strip())
+        st.rerun()
