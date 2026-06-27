@@ -7,9 +7,7 @@
 chroma_db/
 user_chroma_db/
 
-# User notes (privacy + size)
-data/notes/*
-!data/notes/.gitkeep
+# User-uploaded PDFs (privacy + size)
 data/uploads/*
 !data/uploads/.gitkeep
 
@@ -34,3 +32,10 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+# LangGraph SQLite checkpointer (holds in-progress quiz state)
+user_chroma_db/langgraph_checkpoints.db
+
+# Personal teaching/interview docs (kept locally for personal reference, not pushed to remote)
+TEACHING.md
+INTERVIEW_QA.md

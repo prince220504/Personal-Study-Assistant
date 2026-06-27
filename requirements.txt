@@ -4,6 +4,7 @@ langchain-groq
 langchain-huggingface
 langchain-chroma
 langgraph
+langgraph-checkpoint-sqlite
 chromadb
 streamlit
 pypdf
