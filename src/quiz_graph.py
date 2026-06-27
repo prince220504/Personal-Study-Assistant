@@ -1,14 +1,17 @@
 """
-Quiz Graph — LangGraph-style state machine for the Quiz Me feature.
+Quiz Graph — LangGraph state machine for the Quiz Me feature.
 
-The Streamlit page now drives the compiled StateGraph. LangGraph keeps the
-quiz state in a MemorySaver checkpoint and pauses before the grade node so
-Streamlit can collect the user's answer.
+The Streamlit page drives the compiled StateGraph. LangGraph keeps the quiz
+state in a SQLite checkpointer (so in-progress quizzes survive an app
+restart) and pauses before the grade node so Streamlit can collect the
+user's answer.
 
 Concepts used:
 - State: shared dict every node reads/writes
 - Node: function (state) -> partial state update
 - Conditional routing: function (state) -> next-node name
+- Skip-signal: page sets retries=1 to force the router to "advance" instead
+  of "hint" (user chose to skip the question)
 """
 
 import json
@@ -22,12 +25,13 @@ from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_core.exceptions import OutputParserException
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.checkpoint.memory import MemorySaver
 
 from .ingest import build_vectorstore
 from .prompts import QUIZ_GEN_PROMPT, GRADE_PROMPT, HINT_PROMPT
 from .schemas import QuizQuestion, GradeResult
-from .config import GROQ_API_KEY, LLM_MODEL, TOP_K
+from .config import GROQ_API_KEY, LLM_MODEL, TOP_K, ACTIVE_CHROMA_DIR
 
 
 # ---------- State ----------
@@ -162,8 +166,17 @@ def retrieve_topic_content(state: QuizState) -> dict:
     Node: pull top-k chunks from Chroma for the topic.
     Joins them into a single string the LLM can read.
     Also extracts source citations (filename + page) for UI display.
+
+    For questions after the first, we perturb the retrieval query with the
+    question number. Chroma's embedding similarity search then surfaces
+    different chunks on each call instead of returning the same top-k every
+    time. Combined with the history-aware QUIZ_GEN_PROMPT, this prevents
+    Q2/Q3 from being near-duplicates of Q1.
     """
-    docs = _get_retriever().invoke(state["topic"])
+    asked = state.get("asked_count", 0)
+    base_topic = state["topic"]
+    query = base_topic if asked == 0 else f"{base_topic} (aspect {asked + 1})"
+    docs = _get_retriever().invoke(query)
     if not docs:
         return {"context": "", "source_citations": []}
     ctx = "\n\n".join(d.page_content for d in docs)
@@ -188,13 +201,27 @@ def generate_question(state: QuizState) -> dict:
     Node: ask the LLM to write ONE question + the expected answer.
     Resets per-question fields (retries, hint, user_answer, verdict, feedback).
 
+    Passes the last few questions from `state["history"]` to the prompt so the
+    LLM can avoid repeating them. The prompt itself is responsible for
+    picking a different sub-topic; this node just feeds it the context.
+
     Primary path: prompt | llm | JsonOutputParser validates against QuizQuestion.
     Fallback: if the parser rejects the LLM output, try _safe_json_loads as
     a last-ditch attempt before surfacing the error.
     """
+    history = state.get("history", [])
+    recent = history[-3:]  # last 3 questions
+    if recent:
+        prev_text = "Previous questions on this topic:\n" + "\n".join(
+            f"- {entry['q']}" for entry in recent
+        )
+    else:
+        prev_text = ""
+
     inputs = {
         "context": state["context"],
         "format_instructions": _question_format,
+        "previous_questions": prev_text,
     }
     try:
         data = _question_chain.invoke(inputs)
@@ -270,18 +297,30 @@ def advance_question(state: QuizState) -> dict:
     """
     Node: log the result of the current question, update score and weak topics,
     bump asked_count, and clear per-question fields ready for the next round.
+
+    `skipped` is True when the user picked "Skip to next" instead of
+    "Get hint" after a wrong answer (signalled by retries >= 1 with a
+    non-correct verdict and no actual retry attempt — i.e. no fresh
+    user_answer was graded). Such entries count as wrong for scoring/weak
+    topics but are marked in history for UI display.
     """
     correct = state["verdict"] == "correct"
+    skipped = (
+        not correct
+        and state.get("retries", 0) >= 1
+        and not state.get("user_answer")  # hint path clears user_answer; skip has none
+    )
     return {
         "asked_count": state["asked_count"] + 1,
         "score": state["score"] + (1 if correct else 0),
         "history": state["history"] + [{
             "q": state["question"],
             "expected": state["expected"],
-            "user_answer": state["user_answer"],
+            "user_answer": state.get("user_answer"),
             "verdict": state["verdict"],
             "topic": state["topic"],
             "sources": list(state.get("source_citations", [])),
+            "skipped": skipped,
         }],
         "weak_topics": (
             state["weak_topics"] + [state["topic"]]
@@ -350,11 +389,15 @@ def route_after_advance(state: QuizState) -> Literal["new_question", "end"]:
 
 def _build_quiz_graph():
     """
-    Build and compile the quiz StateGraph with a MemorySaver checkpointer.
+    Build and compile the quiz StateGraph with a SQLite checkpointer.
 
     The checkpointer keeps state per `thread_id` so the same conversation
     can be paused and resumed across multiple .invoke() calls. Streamlit
     treats each quiz session as one thread_id.
+
+    SQLite (via SqliteSaver) means in-progress quizzes survive an app
+    restart — a half-finished quiz can be resumed by calling graph.invoke
+    with the same thread_id.
     """
     g = StateGraph(QuizState)
 
@@ -383,8 +426,21 @@ def _build_quiz_graph():
         {"new_question": "retrieve", "end": END},
     )
 
+    # Use SQLite checkpointer (persists across app restarts) under
+    # user_chroma_db/. Falls back to MemorySaver only if the SQLite path
+    # can't be created (e.g. permissions issue).
+    db_path = ACTIVE_CHROMA_DIR / "langgraph_checkpoints.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(str(db_path), check_same_thread=False)
+        checkpointer = SqliteSaver(conn)
+        checkpointer.setup()  # create tables if missing
+    except Exception:
+        checkpointer = MemorySaver()
+
     return g.compile(
-        checkpointer=MemorySaver(),
+        checkpointer=checkpointer,
         interrupt_before=["grade"],
         interrupt_after=["grade"],
     )
