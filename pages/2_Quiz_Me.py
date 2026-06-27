@@ -48,6 +48,19 @@ def _continue_after_feedback():
     st.session_state.quiz_state = graph.invoke(None, _graph_config())
 
 
+def _skip_to_next():
+    """
+    User picked 'Skip to next question' after a wrong answer.
+    Signal the skip to the graph by setting retries=1 and clearing
+    user_answer. The router then returns 'advance' instead of 'hint'
+    and advance_question detects the (retries>=1, user_answer=None)
+    pattern as a skip (no hint, no retry, no score).
+    """
+    graph = get_quiz_graph()
+    graph.update_state(_graph_config(), {"retries": 1, "user_answer": None})
+    st.session_state.quiz_state = graph.invoke(None, _graph_config())
+
+
 # ---------- Quiz setup screen ----------
 
 if st.session_state.quiz_state is None:
@@ -176,20 +189,48 @@ if state.get("hint"):
     st.info(f"Hint: {state['hint']}")
 
 if state.get("verdict"):
-    col1, col2 = st.columns([1, 5])
-    with col1:
-        continue_quiz = st.button("Continue", type="primary")
-    with col2:
-        quit_quiz = st.button("Quit quiz")
+    verdict = state["verdict"]
+    is_wrong = verdict in {"incorrect", "partial"}
 
-    if quit_quiz:
-        _reset_quiz()
-        st.rerun()
+    if is_wrong:
+        # Wrong answer: user chooses between getting a hint or skipping
+        col1, col2, col3 = st.columns([1, 1, 4])
+        with col1:
+            hint_btn = st.button("Get hint", type="primary")
+        with col2:
+            skip_btn = st.button("Skip to next")
+        with col3:
+            quit_btn = st.button("Quit quiz")
 
-    if continue_quiz:
-        with st.spinner("LangGraph is routing the next step..."):
-            _continue_after_feedback()
-        st.rerun()
+        if quit_btn:
+            _reset_quiz()
+            st.rerun()
+
+        if hint_btn:
+            with st.spinner("LangGraph is generating a hint..."):
+                _continue_after_feedback()
+            st.rerun()
+
+        if skip_btn:
+            with st.spinner("LangGraph is moving to the next question..."):
+                _skip_to_next()
+            st.rerun()
+    else:
+        # Correct answer: just continue forward
+        col1, col2 = st.columns([1, 5])
+        with col1:
+            continue_quiz = st.button("Continue", type="primary")
+        with col2:
+            quit_quiz = st.button("Quit quiz")
+
+        if quit_quiz:
+            _reset_quiz()
+            st.rerun()
+
+        if continue_quiz:
+            with st.spinner("LangGraph is routing the next step..."):
+                _continue_after_feedback()
+            st.rerun()
 
 else:
     answer_key = f"answer_{st.session_state.quiz_thread_id}_{state['asked_count']}_{state['retries']}"
